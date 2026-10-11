@@ -79,5 +79,5 @@ ruff check benchmarks tests/benchmarks
 ruff format --check benchmarks tests/benchmarks
 ```
 
-Reference-dependent tests skip if `JEVBENCH_ROOT` is absent. Mock and loopback tests
+Reference-dependent tests skip if `JEVBENCH_ROOT` is absent. Mock tests
 check collection and scoring behavior; model quality and latency come from the linked real runs.
