@@ -8,10 +8,13 @@ Every front that asks "which one" (the tool loop, the browser policy, the rails,
 talks only to `DecisionModel`; the wire client is private to `s1a/decision_models/`. A decision model is a classifier over options the caller enumerates. It
 reads a state and returns a distribution over the offered keys. Hugging Face writes "System 1 decision model" and
 TypeSafe "System One model". This repository uses the terms interchangeably. `--model` picks the backend: `jev` (TypeSafe Jev over HTTP),
+`clm` (CLM's `clm-serve` over HTTP, see [clm.md](clm.md)),
 `laya` (in process, behind `uv sync --extra laya`), `laya-served` (Laya served over HTTP by system1-omni, see
 [served-laya.md](served-laya.md)), `cua` (Cua-S1 Nano in process, behind `uv sync --extra cua`),
 `random` and `rule` (the tool front's baselines).
 `build_model(model_name, seed=, rule=)` builds one from the environment; `llm` names the chat model, which `build_model` does not build.
+
+The registered paths, input modalities and question types are summarized in the [decision-model capability matrix](capabilities.md), separately from run evidence and hardware validation.
 
 ## The interface
 
@@ -20,6 +23,10 @@ Input: an `Observation(state, images=())` (a JSON object or plain text) and type
 the browser's element rows); `NoulQuestion(question, criteria=)` asks whether a statement holds. Output: a
 `Decision(answers, latency_ms, usage, model, raw)` with one `Choice(key, probabilities, confidence)` or
 `Noul(p, confidence)` per question name.
+
+`Usage.known` distinguishes reported zero tokens from missing or malformed provider usage. A local backend can
+return `Usage()` for a known zero; `Usage.from_payload` preserves tolerant counts but marks incomplete usage unknown.
+Input-only decision usage is accepted with zero output tokens. Consumers must not price a partial total as complete.
 
 ```python
 model = build_model("jev")
@@ -44,9 +51,11 @@ shorthands; `warm()` and `close()` open and release the backend.
 | `--model` | class | `name` | notes |
 |---|---|---|---|
 | `jev` | `JevModel(transport)` | `jev` | the request body every front sent before the layer existed, byte for byte; `from_env` picks TypeSafe or the OpenRouter proxy (see [configuration.md](configuration.md)) |
+| `clm` | `ClmModel(client, model=)` | `clm` | CLM behind `/v1/systemone`: a frozen Qwen3-8B encoder and two projection heads, scored by an engine that owns everything after the encoder. One POST per decision; `MODEL_SERVICE_CONFIG_ERROR` without `CLM_URL`, `MODEL_CALL_FAILED` when nothing is listening, on an error status, or on a body with no `answers`. Records `url`, the `X-Request-Id` it sent and `served_by` (the served names, read once — by `warm()` on the agent fronts, or on the first decision for `decide`/`probe`); choice and noul ([docs/clm.md](clm.md)) |
 | `laya` | `LayaModel(agent, model=)` | `laya` | one forward pass per call on a thread; `MODEL_SERVICE_CONFIG_ERROR` when `input_tokens` fills the window (Laya cuts the state silently; see `LAYA_MAX_LEN` and `LAYA_HEAD_MAX_LEN` in [configuration.md](configuration.md)); `ValueError` and `RuntimeError` from the library become `MODEL_CALL_FAILED` |
 | `laya-served` | `ServedLayaModel(client, model=, max_len=)` | `laya-served` | one `POST /v1/systemone` per request to `LAYA_SERVED_URL`, body built with `laya_question()` as for `laya`; one retry on a dropped connection, 502 or 504, and after `Retry-After` on 503, all within `LAYA_SERVED_TIMEOUT_S`; the same window check as `laya`; `model` is the served checkpoint and revision, and `raw` keeps `served_by`, `url`, `request_id` and `server_timing` (see [served-laya.md](served-laya.md)) |
 | `cua` | `CuaS1Model(scorer, collator, model=, context_bytes=, option_bytes=)` | `cua` | Cua-S1 Nano, one `score_elements` pass per request on a thread; choice questions only, text only, deterministic; the context is header, state and rules; the checkpoint reads its first 256 bytes, and the first overflowing request logs one warning; `from_env` reads `CUA_S1_*` (see [configuration.md](configuration.md)) |
+| `omnijev` | `OmniJevModel(agent, model=)` | `omnijev` | OmniJev (a Qwen3.5 vision-language decision model), one `MSO1.system_one` call per request on a thread; choice and noul questions over the observation's screenshot, deterministic; the text state, goal and rules go in front of each question (a browser state puts its recent actions first and caps the page text at 2,000 characters, so a long page cannot push the history out of the 6,000-character context), a browser element row becomes its label and value; a choice's probabilities, which OmniJev leaves `abstain` out of, are renormalised over the offered keys; an observation without an image is `MODEL_CALL_FAILED`; `from_env` reads `OMNIJEV_*` (see [configuration.md](configuration.md)); in process only: system1-omni has no OmniJev vision worker yet (its supported models are Laya, Open-Jev text and Cua-S1 screenshots), so there is no served `omnijev` path |
 | `random` | `RandomModel(seed)` | `random` | uniform over the offered keys, confidence 0, one seeded stream per episode; choice questions only |
 | `rule` | `RuleModel(name, rule)` | the rule's name | one-hot, confidence 1; a key outside the menu raises `RuntimeError`, a bug in the rule |
 
@@ -96,6 +105,12 @@ real servers in `tests/data/served_laya/`. Nothing patches `httpx`.
 3. `tests/test_decision_models_<backend>.py` with `Test<Backend>Contract(DecisionModelContract, IsolatedAsyncioTestCase)`
    plus the backend's mapping tests; a fake for its SDK lives in that file.
 4. An optional extra in `pyproject.toml` and an env block in `.env.example` when it needs a dependency.
+5. For an in-process backend, time a cold `from_env()` in a fresh process and report the load time in the PR,
+   separately from warm inference and episode timing. Profile loads above 5 s. If the loader builds a model
+   from its config (`AutoModel.from_config` or a bare `nn.Module`) and then replaces every weight with a
+   checkpoint, it can skip random initialization with transformers' `no_init_weights`, but only if loading
+   fails on missing keys (`strict=True` or an equivalent check). Prefer fixing this in the model's package;
+   Laya added the skip in 0.3.9. This step does not apply to backends served over HTTP.
 
 ### Laya browser input shaping
 

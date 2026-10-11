@@ -23,7 +23,9 @@ from s1a.decision_models import (
     RuleModel,
     ScriptedModel,
 )
+from s1a.decision_models.omnijev import OmniJevModel
 from s1a.decision_models.served import ServedLayaModel
+from s1a.decision_models.cua_four_b import CuaFourBModel
 
 
 class TestBillingContract(TestCase):
@@ -33,6 +35,8 @@ class TestBillingContract(TestCase):
             LayaModel: False,
             ServedLayaModel: False,
             CuaS1Model: False,
+            OmniJevModel: False,
+            CuaFourBModel: False,
             RandomModel: False,
             RuleModel: False,
             ScriptedModel: False,

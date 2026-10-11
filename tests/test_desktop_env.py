@@ -1,12 +1,12 @@
 # coding: utf-8
-"""``WindowEnv`` over the fake calculator: candidates, snapshot-bound clicks, done and score, dry run, reserved keys."""
+"""``WindowEnv`` over the fake calculator: candidates, snapshot-bound clicks, done and score, dry run."""
 
 from __future__ import annotations
 
 from unittest import IsolatedAsyncioTestCase
 
-from s1a.desktop.driver import Snapshot
-from s1a.desktop.env import ABSTAIN, DONE, WindowEnv
+from s1a.desktop.driver import Element, Snapshot
+from s1a.desktop.env import ABSTAIN, DONE, WindowEnv, clickable, observable
 from support_desktop import FakeCalculator
 
 
@@ -26,20 +26,26 @@ def _env(fake: FakeCalculator, *, execute: bool = True) -> WindowEnv:
 
 
 class TestWindowEnv(IsolatedAsyncioTestCase):
-    async def test_candidates_are_the_clickable_elements_plus_done_and_abstain(self) -> None:
+    async def test_menu_items_and_unlabelled_window_controls_are_not_candidates(self) -> None:
+        self.assertFalse(clickable(Element(1, "AXMenuItem", "Shut Down", "", "token", ("AXPress",))))
+        self.assertFalse(clickable(Element(2, "AXButton", "", "", "token", ("AXPress",))))
+        self.assertFalse(clickable(Element(4, "AXButton", "Saved", "", "token", ("AXPress",), enabled=False)))
+        self.assertTrue(clickable(Element(3, "AXButton", "Save", "", "token", ("AXPress",))))
+        self.assertFalse(observable(Element(1, "AXMenuItem", "Shut Down", "", "token", ("AXPress",))))
+        self.assertFalse(observable(Element(2, "AXButton", "", "", "token", ("AXPress",))))
+        self.assertTrue(observable(Element(4, "AXTextArea", "Status", "Saved", "token", ())))
+
+    async def test_candidates_are_the_clickable_elements_plus_abstain_until_success(self) -> None:
         env = _env(FakeCalculator())
         await env.reset()
         offered = await env.candidates()
         self.assertEqual(offered["click:7"], 'AXButton "7"')
-        self.assertEqual(
-            (offered[DONE], offered[ABSTAIN]),
-            (
-                "The window shows the task finished; stop here.",
-                "No offered click moves the task forward; stop without acting.",
-            ),
-        )
+        self.assertNotIn(DONE, offered)  # a premature done cannot be a valid model choice
+        self.assertEqual(offered[ABSTAIN], "No offered action moves the task forward; stop without acting.")
+        with self.assertRaises(KeyError):
+            await env.step(DONE)
         self.assertNotIn("click:keypad", offered)  # no press action
-        self.assertEqual(len(offered), 13 + 2)
+        self.assertEqual(len(offered), 13 + 1)
 
     async def test_a_step_clicks_the_token_of_the_latest_snapshot_in_the_bound_window_and_re_reads(self) -> None:
         fake = FakeCalculator()
@@ -52,22 +58,51 @@ class TestWindowEnv(IsolatedAsyncioTestCase):
         self.assertEqual(fake.clicks[-1][2], "tok-7-5")  # the token of the snapshot the model saw
         state = await env.observe()
         self.assertEqual((state["goal"], state["app"]), ("compute 12 times 7", "Calculator"))
-        self.assertEqual(
-            (state["presses"], state["progress"]), (["1", "2", "Multiply", "7"], {"values": ["7"], "presses": 4})
-        )
+        self.assertEqual(state["presses"], ["1", "2", "Multiply", "7"])
+        self.assertEqual(state["progress"]["values"], ["7"])
+        self.assertEqual(state["progress"]["title"], "Calculator")
+        self.assertEqual(state["progress"]["elements"], state["elements"])
+        self.assertNotIn("presses", state["progress"])  # the count is gone: the window is the progress
         self.assertEqual(state["elements"][0], {"role": "AXStaticText", "label": "", "value": "7"})
         self.assertEqual((env.done, env.score), (False, 0.0))
         await env.step("click:Equals")
         self.assertEqual((env.done, env.score, await env.candidates()), (True, 1.0, {}))
 
-    async def test_done_and_abstain_end_the_episode_without_a_click(self) -> None:
-        for key in (DONE, ABSTAIN):
-            with self.subTest(key=key):
+    async def test_refresh_re_reads_the_window_with_new_tokens(self) -> None:
+        fake = FakeCalculator()
+        env = _env(fake)
+        await env.reset()
+        fake.display = "4"  # the window moved on its own since the snapshot
+        await env.refresh()
+        self.assertEqual(fake.snapshots, 3)  # reset's clear made two, refresh the third
+        self.assertEqual((await env.observe())["progress"]["values"], ["4"])
+        await env.step("click:1")  # offered from the refreshed snapshot, so its token is current
+        self.assertEqual(fake.clicks[-1][2], "tok-1-3")
+
+    async def test_refresh_keeps_a_done_or_planned_episode_done(self) -> None:
+        for execute in (True, False):
+            with self.subTest(execute=execute):
                 fake = FakeCalculator()
-                env = _env(fake)
+                env = _env(fake, execute=execute)
                 await env.reset()
-                await env.step(key)
-                self.assertEqual((env.done, env.score, len(fake.clicks)), (True, 0.0, 1))
+                end = ABSTAIN if execute else "click:1"
+                await env.step(end)
+                self.assertTrue(env.done)
+                planned = (await env.observe()).get("planned")
+                await env.refresh()
+                self.assertTrue(env.done)
+                self.assertEqual((await env.observe()).get("planned"), planned)
+
+    async def test_refresh_before_reset_is_an_error(self) -> None:
+        with self.assertRaises(RuntimeError):
+            await _env(FakeCalculator()).refresh()
+
+    async def test_abstain_ends_the_episode_without_a_click(self) -> None:
+        fake = FakeCalculator()
+        env = _env(fake)
+        await env.reset()
+        await env.step(ABSTAIN)
+        self.assertEqual((env.done, env.score, len(fake.clicks)), (True, 0.0, 1))
 
     async def test_a_dry_run_plans_one_click_and_ends_without_touching_the_window(self) -> None:
         fake = FakeCalculator()

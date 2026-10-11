@@ -16,9 +16,12 @@ hook of a running agent. The injection guard rail fails closed: a decision error
 | `blackjack` | tool | payoff per hand (RLCard) | `s1a run blackjack --model jev --rethink off --episodes 100` |
 | `injection_guard` | rail | precision and recall on a labelled injection set | `s1a run injection_guard` |
 
-Every tool agent takes `--model jev|laya|cua|llm|random|rule`, `--rethink on|off`, `--episodes N`, `--seed S`,
+Every tool agent takes `--model jev|clm|laya|laya-served|cua|llm|random|rule`, `--rethink on|off`, `--episodes N`, `--seed S`,
 `--max-steps` and `--timeout`, and writes a Harbor-shaped job folder under `evals/results/<agent>/`. A browser agent
-takes `--model jev|laya|cua|llm` and `--goal`. A rail takes `--model jev|laya`, the two models that answer `noul`.
+takes `--model jev|clm|laya|laya-served|cua|omnijev|llm`, `--goal` and the same `--rethink` flag.
+The desktop agent adds `--rethink-attempts` and `--rethink-timeout` and stalls after 3 actions without observed
+progress. The browser front takes the same three names; `docs/browser-front.md` decision 19 describes its branch. A rail takes
+`--model jev|clm|laya|laya-served`, the models that answer `noul`.
 `uv run python -m evals.table evals/results` aggregates every job folder per eval and model into one table.
 
 Every `run` prints one JSON object on stdout and nothing else there; `s1a-mcp` serves the same agents over stdio
@@ -26,12 +29,46 @@ with `list_agents`, `run_agent` and `decide`. Flags, exit codes and the job-fold
 [architecture.md](architecture.md). The extras each agent needs and the keys: `CONTRIBUTING.md`. The `--model` values and the
 models behind them: [architecture.md](architecture.md#models).
 
+Desktop recovery treats a changed progress observation as progress even when the completion score stays zero.
+When screenshots are enabled, progress includes the decoded image dimensions and an RGBA pixel hash; capture IDs
+and PNG metadata do not affect it. The hash is cached per snapshot, and image bytes stay outside the JSON state.
+Persistent no-ops and repeated states can trigger recovery; progress clears the detection window without refunding
+attempts or time. The full terminal fields, including `next_action`, are saved separately in `episode.extra.terminal`.
+
+With bounded recovery enabled, a failed refresh or plan records a short failure category and a suggested next
+action. Provider exception bodies are not stored. An empty or whitespace-only plan counts as a failed plan. The empty reply
+still consumes the one attempt and its active time, and the fresh observation is kept. A task the policy still
+answers `BLOCKED` after one or more replans is a failure too, even when a partial answer was fetched: the answer is
+context only and the run carries the block reason and a next action, without being reported as a failed or exhausted
+recovery. Failed and cancelled chat calls still count toward the run's call total.
+If a call's token usage is unknown, the reported cost stays unknown rather than becoming zero.
+
 ## Agent-specific flags
 
 `s1a run <agent> --help` lists every flag with its default. Beyond the shared ones: `flights` and `allrecipes` take `--goal`,
-`--batch on|off`, `--prefetch on|off`, `--goal-values on|off`, `--profile-out` and `--logs-dir`; `desktop` takes
-`--app`, `--goal`, `--expect`, `--execute`, `--plan` and `--clear`; `ticket_router` takes `--dataset` and
-`--batch-size`; `injection_guard` takes `--labelled-set`. The four games take no flag of their own.
+`--batch on|off`, `--prefetch on|off`, `--goal-values on|off`, `--rethink on|off`, `--rethink-attempts`,
+`--rethink-timeout`, `--profile-out` and `--logs-dir`; `desktop` takes `--app`, `--app-path`, `--window-title`,
+`--goal`, `--expect`, `--execute`, `--plan`, `--clear`, `--text`, `--text-target`, `--text-mode`, `--verify-file`,
+`--pixel-target` and the same three `--rethink` flags; `ticket_router` takes `--dataset` and `--batch-size`;
+`injection_guard` takes `--labelled-set`. The four games take no flag of their own.
+
+### Desktop text input
+
+`--text` supplies the content for a `type:*` action. `--text-target` selects an exact field label or native
+identifier. The default `--text-mode insert` inserts at the current selection; `replace` sets the whole field.
+Both require a fresh readback before the input is recorded as successful. Chinese and multiline text are
+supported through native field replacement. `--window-title` selects the document when an app has several windows.
+
+`--verify-file` requires the expected window state and a file changed during this episode whose UTF-8 content
+matches `--text`. Without `--execute`, the first decision is only recorded as a plan.
+The [macOS fixture](../evals/desktop/README.md) provides a local Laya demo and a fixed-plan execution check.
+
+### Desktop screenshot targets
+
+`--pixel-target KEY=X,Y` offers named points in screenshot fractions. Local Cua-S1 4B multimodal can select
+among them when controls have no accessibility elements. Each click carries its screenshot capture ID.
+Install the `cua-four-b` extra and set `CUA_S1_VARIANT=4b`, `CUA_S1_MODALITY=multimodal`.
+See [the macOS visual task](../evals/desktop/visual.md) for setup and verification commands.
 
 ## Allrecipes
 

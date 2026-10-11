@@ -26,10 +26,11 @@ scripts/smoke.sh
 On Windows, run `scripts/smoke.sh` and the Git hooks from Git Bash with the native Windows `uv` on `PATH`.
 The shell scripts and hooks keep LF line endings even when Git's `core.autocrlf` is enabled.
 
-CI runs these on two installs: the core (`uv sync --extra dev`, on Linux with Python 3.11 and 3.13 and on
-Windows with Python 3.11, where the game tests skip) and the contributor install above (on Linux, where the
-ALFWorld tests skip and the GIF test renders in the Chromium that `playwright install` fetches). `uv build`
-and `ty check` run in the core job only, since the extras resolve the optional imports `ty` is told to ignore.
+CI runs these on two installs: the core (`uv sync --extra dev`, on Linux with Python 3.11 and 3.13 on every
+run, and on Windows with Python 3.11 on pushes to `main` and the weekly schedule, where the game tests skip)
+and the contributor install above (on Linux, where the ALFWorld tests skip and the GIF test renders in the
+Chromium that `playwright install` fetches). `uv build` and `ty check` run in the core jobs only, since the
+extras resolve the optional imports `ty` is told to ignore.
 `scripts/smoke.sh` is the contract for the core install: `list`, `--help` for every agent, `decide` without a key
 and the MCP listing must work with no extra installed. A game whose extra is missing must say which one on stderr.
 
@@ -219,6 +220,15 @@ Video and raw trace/results: ...
 Reuse permission and attribution: ...
 ```
 
+## AI review
+
+CodeRabbit reviews each non-draft pull request when it opens and again on every push (Dependabot's excepted), and checks
+the change against the issues it closes (`Closes #N`). It needs the CodeRabbit GitHub App installed on the repository by
+an owner; reviews of public repositories are free. `.coderabbit.yaml` holds its settings and the per-path focus, and it
+reads `.claude/skills/review-pr/SKILL.md` and this file as the review criteria, so the criteria live in one place.
+CodeRabbit cannot run tests; a maintainer verifies every finding. To review by hand with the same criteria, ask Claude
+Code to use the `review-pr` skill on a pull request or a branch.
+
 ## Extras
 
 Everything outside `openjiuwen` is an extra. An agent whose extra is missing says so on stderr and exits 1.
@@ -231,9 +241,11 @@ Everything outside `openjiuwen` is an extra. An agent whose extra is missing say
 | `report` | pillow, playwright | `python -m evals.replay`, the showcase pages and GIFs; `--gif` also needs `uv run playwright install chromium` |
 | `laya` | laya (torch, transformers) | `--model laya` on every agent and on `decide` and `probe`: Laya in process, no Jev key; the checkpoint downloads into the Hugging Face cache (`HF_HOME`) on first use |
 | `cua` | cua-s1 (torch), huggingface-hub | `--model cua` on tool and browser agents and on `decide` and `probe`: Cua-S1 Nano in process; the 3 MB checkpoint downloads into the Hugging Face cache (`HF_HOME`) on first use |
+| `omnijev` | torch, torchvision, transformers, peft, accelerate, safetensors | `--model omnijev` on the browser agents: OmniJev in process, no Jev key; the model code is a clone of the OmniJev repository named by `OMNIJEV_REPO`, the checkpoint and base model by `OMNIJEV_CHECKPOINT` and `OMNIJEV_BASE` (`docs/configuration.md`) |
 | `dev` | pytest, pytest-asyncio, ruff, ty, jsonschema, pyyaml, referencing | the test suite, `scripts/smoke.sh` and the lint and type checks; the last three check the served-Laya fixtures against `docs/api/` |
+| `cua-four-b` | the `cua` extra, transformers 5, peft, torchvision, pillow | optional local Cua-S1 4B; set `CUA_S1_VARIANT=4b`, and `CUA_S1_MODALITY=text` or `multimodal` |
 
-`uv sync --all-extras` installs all seven. The CLI runs from a checkout; a wheel install (`uv tool install`,
+`uv sync --all-extras` installs all eight. The CLI runs from a checkout; a wheel install (`uv tool install`,
 `pip install`) is unsupported, because the data folders (`evals/2048`, `evals/millionaire`, `evals/labelled`) sit
 next to the package; the command refuses to start outside a checkout with one line on stderr. Runs, logs and
 results go under the checkout (`runs/`, `evals/results`), or under `S1A_HOME` when that variable names another

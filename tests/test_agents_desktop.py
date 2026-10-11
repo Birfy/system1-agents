@@ -6,14 +6,23 @@ from __future__ import annotations
 import json
 import tempfile
 from pathlib import Path
+from typing import Any, AsyncIterator
 from unittest import IsolatedAsyncioTestCase, TestCase
 from unittest.mock import AsyncMock, patch
 
+from openjiuwen.core.foundation.llm import AssistantMessage, AssistantMessageChunk, Model
+from openjiuwen.core.runner import Runner
+
 from s1a.agents import desktop
-from s1a.desktop.driver import Element, Snapshot, Window
+from s1a.decision_models import RuleModel
+from s1a.desktop.driver import DriverError, Element, Snapshot, Window
+from s1a.desktop.env import WindowEnv
+from s1a.recovery import RecoveryLimits
 from s1a.run import started_runner
 from s1a.tool import loop, series
+from s1a.tool.models import placeholder_model
 from support_desktop import FakeCalculator, FakeWindowsCalculator
+from test_desktop_driver import _process, _result
 
 CALCULATOR = ["--app", "Calculator", "--goal", "compute 12 times 7", "--expect", "84"]
 PLAN = ["--plan", "1,2,Multiply|×,7,Equals|=", "--clear", "All Clear"]
@@ -45,15 +54,28 @@ class TestPieces(TestCase):
         self.assertTrue(
             desktop.shows(Snapshot(window, None, (Element(2, "AXStaticText", "PASS", "", None, ()),), {}), "PASS")
         )
+        self.assertTrue(
+            desktop.shows(
+                Snapshot(window, None, (Element(3, "AXButton", "Saved", "", "t", (), enabled=False),), {}), "Saved"
+            )
+        )
 
-    def test_the_plan_rule_follows_the_labels_with_variants_then_says_done_or_abstains(self) -> None:
+    def test_the_plan_rule_follows_the_labels_with_variants_then_abstains(self) -> None:
         rule = desktop.plan_rule(desktop.parse_plan("1, 2,Multiply|×,7,Equals|="))
         offered = {f"click:{label}": "" for label in ("1", "2", "×", "7", "=")}
         self.assertEqual(
             [rule({"presses": ["x"] * n}, offered) for n in range(6)],
-            ["click:1", "click:2", "click:×", "click:7", "click:=", "done"],
+            ["click:1", "click:2", "click:×", "click:7", "click:=", "abstain"],
         )
         self.assertEqual(rule({"presses": []}, {"click:9": ""}), "abstain")
+
+    def test_the_plan_can_name_text_actions(self) -> None:
+        rule = desktop.plan_rule(desktop.parse_plan("type:Body,Save"))
+        offered = {"type:Body": "", "click:Save": ""}
+        self.assertEqual(
+            [rule({"presses": ["x"] * n}, offered) for n in range(3)],
+            ["type:Body", "click:Save", "abstain"],
+        )
 
     def test_the_flags_require_app_goal_and_expect_and_default_to_a_dry_run(self) -> None:
         args = series.parser(desktop.SPEC).parse_args(
@@ -63,6 +85,29 @@ class TestPieces(TestCase):
         with self.assertRaises(SystemExit):
             series.parser(desktop.SPEC).parse_args(["--model", "jev", "--rethink", "off", "--episodes", "1"])
 
+    def test_the_stall_default_and_the_bounded_rethink_flags(self) -> None:
+        self.assertEqual(desktop.SPEC.budget.stall_after, 3)
+        args = series.parser(desktop.SPEC).parse_args(
+            ["--model", "jev", "--rethink", "on", "--episodes", "1", *CALCULATOR]
+        )
+        self.assertEqual((args.rethink_attempts, args.rethink_timeout), (3, 15.0))
+        tuned = series.parser(desktop.SPEC).parse_args(
+            [
+                "--model",
+                "jev",
+                "--rethink",
+                "on",
+                "--episodes",
+                "1",
+                "--rethink-attempts",
+                "5",
+                "--rethink-timeout",
+                "2.5",
+                *CALCULATOR,
+            ]
+        )
+        self.assertEqual((tuned.rethink_attempts, tuned.rethink_timeout), (5, 2.5))
+
     def test_without_a_plan_there_is_no_rule_baseline(self) -> None:
         args = series.parser(desktop.SPEC).parse_args(
             ["--model", "rule", "--rethink", "off", "--episodes", "1", *CALCULATOR]
@@ -70,8 +115,60 @@ class TestPieces(TestCase):
         with patch.object(desktop, "driver_from_env", lambda label: FakeCalculator()):
             self.assertIsNone(desktop.make_series(args).baseline)
 
+    def test_each_series_uses_a_fresh_driver_session_label(self) -> None:
+        args = series.parser(desktop.SPEC).parse_args(
+            ["--model", "rule", "--rethink", "off", "--episodes", "1", *CALCULATOR]
+        )
+        labels: list[str] = []
 
-async def _noop(app: str, driver: object) -> None:
+        def driver(label: str) -> FakeCalculator:
+            labels.append(label)
+            return FakeCalculator()
+
+        with patch.object(desktop, "driver_from_env", driver):
+            desktop.make_series(args)
+            desktop.make_series(args)
+        self.assertEqual(len(labels), 2)
+        self.assertNotEqual(labels[0], labels[1])
+        self.assertTrue(all(label.startswith("s1a-desktop-") for label in labels))
+
+    def test_app_path_is_mac_only(self) -> None:
+        args = series.parser(desktop.SPEC).parse_args(
+            ["--model", "rule", "--rethink", "off", "--episodes", "1", *CALCULATOR, "--app-path", "/tmp/Fixture.app"]
+        )
+        with patch("sys.platform", "win32"), self.assertRaisesRegex(ValueError, "macOS"):
+            desktop.make_series(args)
+
+    def test_file_verification_requires_the_visible_result_and_exact_content(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "saved.txt"
+            args = series.parser(desktop.SPEC).parse_args(
+                [
+                    "--model",
+                    "rule",
+                    "--rethink",
+                    "off",
+                    "--episodes",
+                    "1",
+                    *CALCULATOR,
+                    "--text",
+                    "hello",
+                    "--verify-file",
+                    str(path),
+                ]
+            )
+            with patch.object(desktop, "driver_from_env", lambda label: FakeCalculator()):
+                env = desktop.make_series(args).env_for(0)
+            window = Window(42, 7, "Calculator", "Calculator")
+            shown = Snapshot(window, "s1", (Element(0, "AXStaticText", "", "84", None, ()),), {})
+            self.assertFalse(env._done_when(shown))
+            path.write_text("wrong", encoding="utf-8")
+            self.assertFalse(env._done_when(shown))
+            path.write_text("hello", encoding="utf-8")
+            self.assertTrue(env._done_when(shown))
+
+
+async def _noop(app: str, driver: object, window_title: str = "") -> None:
     return None
 
 
@@ -84,6 +181,38 @@ class _Exited:
 
 
 class TestLaunch(IsolatedAsyncioTestCase):
+    async def test_windows_title_selects_at_launch_and_keeps_the_window_binding(self) -> None:
+        windows = [
+            {"pid": 41, "window_id": 9, "title": "Other"},
+            {"pid": 42, "window_id": 7, "title": "Draft", "app_name": "ApplicationFrameHost.exe"},
+            {"pid": 42, "window_id": 8, "title": "Draft", "is_on_screen": False},
+        ]
+        listed = [*windows, {"pid": 50, "window_id": 7, "title": "Draft", "app_name": "Editor"}]
+        args = series.parser(desktop.SPEC).parse_args(
+            ["--model", "rule", "--rethink", "off", "--episodes", "1"]
+            + ["--app", "Editor", "--window-title", "Draft", "--goal", "Save", "--expect", "Saved"]
+        )
+        with (
+            patch("sys.platform", "win32"),
+            _process(
+                _result({}),
+                _result({"apps": []}),
+                _result({"pid": 100, "windows": windows}),
+                _result({"windows": listed}),
+                _result({"windows": listed}),
+                _result({"elements": []}),
+                _result({}),
+            ) as (driver, session, _),
+            patch.object(desktop, "driver_from_env", return_value=driver),
+        ):
+            task = desktop.make_series(args)
+            async with task.session:
+                env = task.env_for(0)
+                await env.reset()
+                self.assertEqual((await env.observe())["title"], "Draft")
+        target = next(args for name, args in session.calls if name == "get_window_state")
+        self.assertEqual((target["pid"], target["window_id"]), (42, 7))
+
     async def test_windows_launches_through_driver_without_running_macos_open(self) -> None:
         fake = FakeCalculator()
         with (
@@ -102,7 +231,7 @@ class TestLaunch(IsolatedAsyncioTestCase):
             patch.object(desktop.asyncio, "create_subprocess_exec", AsyncMock(return_value=process)) as spawn,
             patch.object(desktop.asyncio, "sleep", AsyncMock()),
         ):
-            await desktop.launch_app("Calculator", FakeCalculator())
+            await desktop.launch_app("Calculator", FakeCalculator(), "Paper Tape")
         spawn.assert_awaited_once_with("open", "-a", "Calculator")
 
     async def test_a_failed_macos_open_raises_with_the_exit_code(self) -> None:
@@ -171,3 +300,139 @@ class TestThroughTheSeries(IsolatedAsyncioTestCase):
             ["click:One", "click:Two", "click:Multiply by", "click:Seven", "click:Equals"],
         )
         self.assertEqual(fake.display, "84")
+
+
+class TestBoundedRethinkRejection(IsolatedAsyncioTestCase):
+    async def test_plain_llm_with_rethink_on_is_rejected_before_the_driver(self) -> None:
+        args = series.parser(desktop.SPEC).parse_args(
+            ["--model", "llm", "--rethink", "on", "--episodes", "1", *CALCULATOR]
+        )
+        touched: list[str] = []
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.object(series, "optional_chat_model", lambda: object()),
+            patch.object(desktop, "driver_from_env", lambda label: touched.append(label)),
+        ):
+            with self.assertRaises(RuntimeError) as caught:
+                await series.play(desktop.SPEC, args, results_dir=Path(tmp))
+        self.assertIn("decision model", str(caught.exception))
+        self.assertEqual(touched, [])  # rejected before the driver or an env was built
+
+
+class PlanChat(Model):
+    """A chat model that answers the replan request with one useful line and counts its calls."""
+
+    def __init__(self) -> None:
+        source = placeholder_model()
+        super().__init__(source.model_client_config, source.model_config)
+        self.calls = 0
+
+    async def invoke(self, messages: Any, *, tools: Any = None, **kwargs: Any) -> AssistantMessage:
+        self.calls += 1
+        return AssistantMessage(content="Click 1, 2, Multiply, 7, Equals.")
+
+    async def stream(self, messages: Any, *, tools: Any = None, **kwargs: Any) -> AsyncIterator[AssistantMessageChunk]:
+        self.calls += 1
+        yield AssistantMessageChunk(content="Click 1, 2, Multiply, 7, Equals.")
+
+
+def _window_env(fake: FakeCalculator, *, clear_labels: tuple[str, ...] = ("All Clear",)) -> WindowEnv:
+    return WindowEnv(
+        fake,
+        app_name="Calculator",
+        goal="compute 12 times 7",
+        done_when=lambda snapshot: snapshot.elements[0].value == "84",
+        execute=True,
+        clear_labels=clear_labels,
+    )
+
+
+async def _bounded_play(
+    env: WindowEnv, decision_model: RuleModel, chat: Model, *, max_acts: int, max_attempts: int = 3
+) -> Any:
+    with tempfile.TemporaryDirectory() as tmp, patch.object(loop, "WORKSPACE", Path(tmp)):
+        await Runner.start()
+        try:
+            return await loop.run_episode(
+                desktop.SPEC,
+                env,
+                model_name="rule",
+                seed=0,
+                chat=chat,
+                decision_model=decision_model,
+                rethink_on=True,
+                max_acts=max_acts,
+                timeout_s=60.0,
+                prices=None,
+                log=False,
+                limits=RecoveryLimits(max_attempts=max_attempts, timeout_s=5.0),
+            )
+        finally:
+            await Runner.stop()
+
+
+CALC_SOLUTION = ["click:1", "click:2", "click:Multiply", "click:7", "click:Equals"]
+
+
+def _solution_rule(solution: list[str]) -> RuleModel:
+    """A rule that no-ops until it sees a plan, then plays the solution to 84 and finishes."""
+    cursor = {"planned": False, "i": 0}
+
+    def rule(state: dict[str, Any], offered: dict[str, str]) -> str:
+        if state.get("plan"):
+            cursor["planned"] = True
+        if not cursor["planned"]:
+            return "click:Multiply"  # a real no-op on this window: the display never moves
+        if cursor["i"] >= len(solution):
+            return "done"
+        key = solution[cursor["i"]]
+        cursor["i"] += 1
+        return key
+
+    return RuleModel("solution", rule)
+
+
+class _DeniedCalculator(FakeCalculator):
+    """A driver that refuses every click, as when Accessibility permission was never granted."""
+
+    async def click(self, window: Window, token: str) -> dict[str, Any]:
+        raise DriverError("click: refused (accessibility permission denied)")
+
+
+class TestBoundedRethinkChain(IsolatedAsyncioTestCase):
+    """WindowEnv, the real ToolDecisionModel and ActTool, and the bounded rail, with no real GUI."""
+
+    async def test_a_no_op_stall_plans_and_the_next_click_uses_the_refreshed_snapshot(self) -> None:
+        fake = FakeCalculator()
+        env = _window_env(fake)
+        chat = PlanChat()
+        episode = await _bounded_play(env, _solution_rule(CALC_SOLUTION), chat, max_acts=12)
+        self.assertEqual((episode.score, fake.display), (1.0, "84"))
+        self.assertEqual([decision["key"] for decision in episode.decisions], ["click:Multiply"] * 3 + CALC_SOLUTION)
+        self.assertEqual(fake.clicks[4][2], "tok-1-6")  # the planned click names the refreshed snapshot's token
+        events = [event for event in episode.extra["rethinks"] if event["kind"] == "stall"]
+        self.assertEqual([event["termination"] for event in events], ["planned"])
+        self.assertEqual(events[0]["trigger_reason"], "stalled")
+        self.assertIn("click:1", events[0]["fresh_obs"]["candidates"])
+        self.assertEqual(chat.calls, 1)
+
+    async def test_the_only_plan_of_a_one_attempt_budget_drives_a_normal_act_success(self) -> None:
+        fake = FakeCalculator()
+        env = _window_env(fake)
+        chat = PlanChat()
+        episode = await _bounded_play(env, _solution_rule(CALC_SOLUTION), chat, max_acts=12, max_attempts=1)
+        self.assertEqual((episode.score, fake.display), (1.0, "84"))
+        stalls = [event for event in episode.extra["rethinks"] if event["kind"] == "stall"]
+        self.assertEqual((len(stalls), stalls[0]["termination"], stalls[0]["attempt"]), (1, "planned", 1))
+        self.assertNotIn("give_up", [event.get("termination") for event in episode.extra["rethinks"]])
+        self.assertIsNone(episode.error)
+
+    async def test_a_permission_denied_click_ends_the_episode_without_a_planner_retry(self) -> None:
+        fake = _DeniedCalculator()
+        env = _window_env(fake, clear_labels=())
+        chat = PlanChat()
+        episode = await _bounded_play(env, RuleModel("first", lambda state, offered: "click:1"), chat, max_acts=12)
+        self.assertEqual(episode.error, "act failed: click: refused (accessibility permission denied)")
+        self.assertEqual((chat.calls, fake.clicks, fake.snapshots), (0, [], 1))  # no refresh, no plan, no retry
+        self.assertEqual(episode.steps, 0)
+        self.assertEqual(episode.extra["rethinks"], [])
