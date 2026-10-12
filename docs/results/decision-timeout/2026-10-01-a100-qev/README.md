@@ -47,7 +47,11 @@ Where the 5 s deadline fails, decision by decision (run `onejev27B_151748`, 30 s
 
 - `runs/<prefix>.log`: each run's stdout and stderr (the final JSON with status, answer and actions, or the
   traceback). `runs/<prefix>.json`: the `--profile-out` record with every decision's time, tokens and choice (absent
-  for the 5 s runs, which were not profiled, and for `140127`). `runs/<prefix>.png`: the final screenshot.
+  for the 5 s runs, which were not profiled, and for `140127`). `runs/<prefix>.png`: the final screenshot. These 69
+  files (25 logs, 19 profiles, 25 screenshots) are kept outside the source tree, in
+  [decision-timeout-2026-10-01-a100-qev-runs.zip](https://github.com/user-attachments/files/33344291/decision-timeout-2026-10-01-a100-qev-runs.zip)
+  (sha256 `372ff9d828250c2b146f341578a2c7bfbaac00fcf443bcb6aa6291986896fe57`), attached to the pull request; the only
+  edit is the run machine's home directory written `~` in five Python library paths.
 - `bench_5s.csv`, `bench_30s.csv`, `bench_30s_fla.csv`: the batch rows (time is the run's end), with the judge's
   verdict.
 - `slow_ok.py`, `compact_ok.py`, `bench.sh`: the launchers and batch script. Home paths are shortened to `~/`.
