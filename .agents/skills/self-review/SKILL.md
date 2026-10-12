@@ -12,6 +12,14 @@ instructions. Record the actual target branch and base/head commits, and review
 the full diff from their merge base plus relevant uncommitted changes. Distinguish
 what is in the PR from local-only work; disclose if the base could not be refreshed.
 
+Before requesting review and after every push, refresh the base against the
+default branch and confirm on GitHub that the pull request reports mergeable and
+that the required checks ran green on the exact head commit offered — record that
+head SHA in the report. A conflicted branch, or a green run pinned to an older
+commit, is a readiness gap: name it rather than reporting CI from a stale state.
+Fork branches' workflow runs sit at `action_required` until a maintainer approves
+them; report that as pending, not as absent or passing.
+
 Apply the [large-code-change requirements](../../../CONTRIBUTING.md#large-code-changes):
 report authored-code and total diff counts separately using the guide's counting
 convention. Above 3,000 changed code lines, verify the contributor's full
