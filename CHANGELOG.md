@@ -22,6 +22,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 
 ### Fixed
 
+- Malformed ticket-router JSONL now names the dataset, physical line and JSON column without printing ticket contents.
 - Laya browser-state compaction preserves the recovery plan for the next decision.
 - Desktop recovery resets its detection window on observed progress without resetting its cumulative budget.
 - Screenshot-enabled desktop recovery detects pixel changes while ignoring capture IDs and PNG metadata.
